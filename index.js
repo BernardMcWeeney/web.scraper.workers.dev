@@ -3,59 +3,162 @@ import contentTypes from './content-types.js'
 import Scraper from './scraper.js'
 import { generateJSONResponse, generateErrorJSONResponse } from './json-response.js'
 
+addEventListener('scheduled', event => {
+  event.waitUntil(handleScheduled(event));
+});
+
 addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request))
-})
+  event.respondWith(handleRequest(event.request));
+});
+
+async function handleScheduled(event) {
+  try {
+    const { premiumDomains, allDomains } = await scrapeAndProcessDomains();
+
+    const emailContent = generateEmailContent(premiumDomains, allDomains);
+
+    await sendEmail(emailContent);
+
+    console.log('Email sent successfully.');
+  } catch (error) {
+    console.error('Error in scheduled function:', error);
+  }
+}
 
 async function handleRequest(request) {
-  const searchParams = new URL(request.url).searchParams
-
-  let url = searchParams.get('url')
-  if (url && !url.match(/^[a-zA-Z]+:\/\//)) url = 'http://' + url
-
-  const selector = searchParams.get('selector')
-  const attr = searchParams.get('attr')
-  const spaced = searchParams.get('spaced') // Adds spaces between tags
-  const pretty = searchParams.get('pretty')
-
-  if (!url || !selector) {
-    return handleSiteRequest(request)
-  }
-
-  return handleAPIRequest({ url, selector, attr, spaced, pretty })
+  return new Response('This Worker runs on a schedule.', {
+    headers: { 'Content-Type': 'text/plain' },
+  });
 }
 
-async function handleSiteRequest(request) {
-  const url = new URL(request.url)
+async function scrapeAndProcessDomains() {
+  // Fetch the domain deletion list
+  const response = await fetch('https://www.weare.ie/deleted-domain-list/');
+  const html = await response.text();
 
-  if (url.pathname === '/' || url.pathname === '') {
-    return new Response(html, {
-      headers: { 'content-type': contentTypes.html }
-    })
-  }
+  // Extract domain names
+  const domains = extractDomainNames(html);
 
-  return new Response('Not found', { status: 404 })
+  // Identify premium domains
+  const premiumDomains = await identifyPremiumDomains(domains);
+
+  return { premiumDomains, allDomains: domains };
 }
 
-async function handleAPIRequest({ url, selector, attr, spaced, pretty }) {
-  let scraper, result
+function extractDomainNames(html) {
+  const domains = [];
+  const regex = /<li>(.*?)<\/li>/g;
+  let match;
 
-  try {
-    scraper = await new Scraper().fetch(url)
-  } catch (error) {
-    return generateErrorJSONResponse(error, pretty)
+  while ((match = regex.exec(html)) !== null) {
+    const domain = match[1].trim();
+    if (domain.endsWith('.ie')) {
+      domains.push(domain);
+    }
   }
 
-  try {
-    if (!attr) {
-      result = await scraper.querySelector(selector).getText({ spaced })
-    } else {
-      result = await scraper.querySelector(selector).getAttribute(attr)
+  return domains;
+}
+
+async function identifyPremiumDomains(domains) {
+  const premiumDomains = [];
+  const dictionary = await getDictionaryWords();
+  const namesList = await getNamesList();
+
+  domains.forEach(domain => {
+    const domainName = domain.replace('.ie', '').toLowerCase();
+
+    // Criteria 1: Short names (5 letters or less)
+    if (domainName.length <= 5) {
+      premiumDomains.push(domain);
+      return;
     }
 
-  } catch (error) {
-    return generateErrorJSONResponse(error, pretty)
-  }
+    // Criteria 2: Dictionary words
+    if (dictionary.has(domainName)) {
+      premiumDomains.push(domain);
+      return;
+    }
 
-  return generateJSONResponse({ result }, pretty)
+    // Criteria 3: People's names
+    if (namesList.has(domainName)) {
+      premiumDomains.push(domain);
+      return;
+    }
+
+    // Additional criteria can be added here
+    // For example, checking for pronounceability or brandability
+  });
+
+  return premiumDomains;
+}
+
+async function getDictionaryWords() {
+  // A small set of common English words for example purposes
+  const words = ['apple', 'orange', 'banana', 'grape', 'peach']; // Extend this list as needed
+  return new Set(words);
+}
+
+async function getNamesList() {
+  // A small set of common first names for example purposes
+  const names = ['john', 'jane', 'michael', 'sarah', 'david']; // Extend this list as needed
+  return new Set(names);
+}
+
+function generateEmailContent(premiumDomains, allDomains) {
+  const purchaseLinkBase = 'https://cp.blacknighthosting.com/cart.php?a=add&domain=register&query=';
+
+  // Premium domains section
+  let premiumSection = 'Premium Domains:\n\n';
+  premiumDomains.forEach(domain => {
+    const link = purchaseLinkBase + encodeURIComponent(domain);
+    premiumSection += `- ${domain}: ${link}\n`;
+  });
+
+  // All domains section
+  let allDomainsSection = 'All Deleted Domains:\n\n';
+  allDomains.forEach(domain => {
+    allDomainsSection += `- ${domain}\n`;
+  });
+
+  // Combine sections
+  const emailBody = `${premiumSection}\n\n${allDomainsSection}`;
+
+  return emailBody;
+}
+
+async function sendEmail(emailContent) {
+  const apiKey = EMAIL_API_KEY; // Set this in your Cloudflare Worker environment variables
+  const fromEmail = FROM_EMAIL; // Set this in your environment variables
+  const toEmail = TO_EMAIL; // Set this in your environment variables
+
+  const data = {
+    personalizations: [
+      {
+        to: [{ email: toEmail }],
+        subject: 'Daily Deleted .ie Domains Summary',
+      },
+    ],
+    from: { email: fromEmail },
+    content: [
+      {
+        type: 'text/plain',
+        value: emailContent,
+      },
+    ],
+  };
+
+  const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(data),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to send email: ${response.status} - ${errorText}`);
+  }
 }
